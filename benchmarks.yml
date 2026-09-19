@@ -1,0 +1,101 @@
+name: benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 1 * *'   # monthly, so a broken lab doesn't sit rotting
+
+jobs:
+  run-lab:
+    name: Load lab and benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A service container can't set shared_preload_libraries, and the lab
+      # needs pg_stat_statements — so run Postgres directly.
+      - name: Start Postgres 16
+        run: |
+          docker run -d --name pg \
+            -e POSTGRES_PASSWORD=lab \
+            -e POSTGRES_DB=shop \
+            -p 5432:5432 \
+            -v "${{ github.workspace }}:/lab:ro" \
+            --shm-size=512m \
+            postgres:16 \
+            postgres \
+              -c shared_preload_libraries=pg_stat_statements \
+              -c pg_stat_statements.track=all \
+              -c shared_buffers=256MB \
+              -c work_mem=4MB \
+              -c max_parallel_workers_per_gather=0
+
+          for i in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres -q && break
+            sleep 1
+          done
+          docker exec pg pg_isready -U postgres
+
+      - name: Load schema and data
+        run: |
+          docker exec pg psql -U postgres -d shop -v ON_ERROR_STOP=1 \
+            -v n_users=40000 -v n_products=4000 -v n_orders=400000 \
+            -f /lab/00_setup.sql
+
+      - name: Syntax-check every lab script
+        run: |
+          for f in /lab/0*.sql; do
+            echo "── $f"
+            docker exec pg psql -U postgres -d shop -v ON_ERROR_STOP=1 \
+              -c "SET check_function_bodies = on" -f "$f" > /dev/null
+          done
+        continue-on-error: false
+
+      - name: Run benchmarks
+        run: |
+          docker exec pg psql -U postgres -d shop -v ON_ERROR_STOP=1 -f /lab/bench/harness.sql
+          docker exec pg psql -U postgres -d shop -v ON_ERROR_STOP=1 -f /lab/bench/benchmarks.sql
+
+      - name: Publish results to the job summary
+        run: |
+          {
+            echo "## Benchmark results"
+            echo
+            echo "> CI runs a reduced dataset (400k orders) on shared runners."
+            echo "> Ratios hold; absolute numbers are slower than a real machine."
+            echo
+            docker exec pg psql -U postgres -d shop -tAc "SELECT bench.report()"
+            echo
+            echo "### Plan changes"
+            echo
+            docker exec pg psql -U postgres -d shop -tAc "SELECT bench.plan_report()"
+          } | tee "$GITHUB_STEP_SUMMARY" > ci-results.md
+
+      - name: Assert every technique actually helped
+        run: |
+          docker exec pg psql -U postgres -d shop -v ON_ERROR_STOP=1 -tAc "
+            SELECT string_agg(technique || ' / ' || scenario, ', ')
+            FROM (
+              SELECT b.technique, b.scenario
+              FROM bench.results b
+              JOIN bench.results a ON a.technique=b.technique
+                                  AND a.scenario=b.scenario AND a.variant='after'
+              WHERE b.variant='before' AND a.exec_ms >= b.exec_ms
+            ) s" > regressions.txt
+          if [ -s regressions.txt ] && [ -n "$(cat regressions.txt)" ]; then
+            echo "Regression — these scenarios got slower:"; cat regressions.txt; exit 1
+          fi
+          echo "All scenarios improved."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: ci-results.md
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f pg || true
