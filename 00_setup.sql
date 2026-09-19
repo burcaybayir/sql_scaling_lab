@@ -6,21 +6,6 @@
 
 \timing on
 
--- Dataset size is overridable so CI can run a small version:
---   psql -v n_users=20000 -v n_products=2000 -v n_orders=200000 -f 00_setup.sql
-\if :{?n_users}
-\else
-  \set n_users 200000
-\endif
-\if :{?n_products}
-\else
-  \set n_products 20000
-\endif
-\if :{?n_orders}
-\else
-  \set n_orders 2000000
-\endif
-
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS pg_prewarm;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -85,7 +70,7 @@ SELECT
     'tier', (ARRAY['free','plus','pro'])[1 + (i % 3)],
     'tags', to_jsonb((ARRAY['newsletter','beta','mobile','web'])[1 + (i % 4):2 + (i % 4)])
   )
-FROM generate_series(1, :n_users) AS i;
+FROM generate_series(1, 200000) AS i;
 
 INSERT INTO products (id, sku, name, category, price_cents)
 SELECT
@@ -94,13 +79,13 @@ SELECT
   'Product ' || i,
   (ARRAY['electronics','books','garden','toys','apparel','grocery'])[1 + (i % 6)],
   200 + (random() * 40000)::int
-FROM generate_series(1, :n_products) AS i;
+FROM generate_series(1, 20000) AS i;
 
 -- Orders: user_id is Zipf-ish (some whales), created_at spread over 3 years.
 INSERT INTO orders (id, user_id, status, created_at, ship_country)
 SELECT
   i,
-  1 + (power(random(), 2) * (:n_users - 1))::bigint,
+  1 + (power(random(), 2) * 199999)::bigint,
   CASE
     WHEN random() < 0.01  THEN 'pending'
     WHEN random() < 0.03  THEN 'shipped'
@@ -108,14 +93,14 @@ SELECT
   END,
   timestamptz '2023-01-01' + (random() * 1000) * interval '1 day',
   (ARRAY['TR','DE','US','GB','FR','NL','ES','IT'])[1 + (i % 8)]
-FROM generate_series(1, :n_orders) AS i;
+FROM generate_series(1, 2000000) AS i;
 
 -- ~2.5 items per order.
 INSERT INTO order_items (id, order_id, product_id, qty, unit_cents)
 SELECT
   row_number() OVER (),
   o.id,
-  1 + (random() * (:n_products - 1))::bigint,
+  1 + (random() * 19999)::bigint,
   1 + (random() * 3)::smallint,
   200 + (random() * 40000)::int
 FROM orders o,
